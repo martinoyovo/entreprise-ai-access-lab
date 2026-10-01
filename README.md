@@ -1,201 +1,337 @@
-# cursor-pulse
+# Enterprise AI Access Lab
 
-A tiny [Cursor CLI](https://cursor.com) (`cursor-agent`) companion that bundles two
-things in one repo:
+A small Claude-powered chat app whose access is controlled by an enterprise IdP (Okta).
+It mirrors the identity layer of Claude Enterprise: SCIM provisioning, SAML SSO,
+group-based roles, and an audit log. It's a learning and portfolio project, not a product.
 
-1. **An on-demand status line** — rendered by `cursor-pulse status` from session
-   state captured by hooks, plus live reads of `cli-config.json` and agent
-   transcripts.
-2. **Desktop notifications** — fired via hooks when Cursor finishes a turn or
-   needs your attention (with focus-aware skip on macOS).
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | SCIM 2.0 server (RFC 7643/7644) | ✅ done |
+| 2 | SAML SSO with Okta | ✅ done |
+| 3 | Group → role → Claude tool mapping | ✅ done |
+| 4 | Deprovisioning + audit log | ✅ done |
+| 5 | Docs, threat model, demo script | planned |
 
-It's the Cursor CLI counterpart to
-[`claude-pulse`](https://github.com/martinoyovo/claude-pulse) and
-[`codex-pulse`](https://github.com/martinoyovo/codex-pulse).
-Dependency-light: portable `bash`/`sh` + `jq` (and `git` for the branch
-segment). No frameworks.
+## Quick start
 
-## Important: no live in-TUI status line
-
-Unlike Claude Code, **Cursor's CLI has no customizable status-line slot** as of
-2026 — there is nothing to "turn on" inside cursor-agent itself. cursor-pulse
-captures session state via hooks and **`cursor-pulse status` renders a line on
-demand**. If you install it and never wire that command anywhere, it will look
-like nothing is working.
-
-**You must embed `cursor-pulse status` somewhere that re-runs often** — your
-shell prompt, starship, or tmux status bar. Run `cursor-pulse doctor` anytime
-for copy-paste snippets.
-
-### Make it feel live
-
-**bash** — add to `~/.bashrc`:
-
-```sh
-PROMPT_COMMAND='PS1="$(cursor-pulse status 2>/dev/null)
-$PS1"'
+```bash
+cp .env.example .env            # then set SCIM_BEARER_TOKEN (openssl rand -hex 32)
+docker compose up -d            # Postgres 16 with access_lab and access_lab_test databases
+npm install
+npm run db:migrate
+npm test                        # runs against TEST_DATABASE_URL (wiped on each test)
+npm run dev                     # http://localhost:3000
 ```
 
-**zsh** — add to `~/.zshrc`:
+Requires Node 20+.
 
-```sh
-precmd() { CURSOR_PULSE_LINE=$(cursor-pulse status 2>/dev/null); }
-PROMPT='${CURSOR_PULSE_LINE:+$CURSOR_PULSE_LINE$'\n'}% '
+## SCIM
+
+Base path: `/scim/v2`. Every request except the discovery endpoints needs
+`Authorization: Bearer $SCIM_BEARER_TOKEN`. Responses use `application/scim+json`, and
+errors use the SCIM error format:
+
+```json
+{ "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"], "status": "409", "scimType": "uniqueness", "detail": "..." }
 ```
 
-**starship** — add to `~/.config/starship.toml`:
+| Endpoint | Methods | Notes |
+|---|---|---|
+| `/Users` | GET, POST | `filter=userName eq "..."` (also `externalId`, `emails.value`), `startIndex`, `count` (max 200) |
+| `/Users/{id}` | GET, PUT, PATCH, DELETE | PATCH returns the updated user (200) |
+| `/Groups` | GET, POST | `filter=displayName eq "..."` (also `externalId`), `excludedAttributes=members` |
+| `/Groups/{id}` | GET, PUT, PATCH, DELETE | PATCH returns 204 |
+| `/ServiceProviderConfig`, `/Schemas`, `/ResourceTypes` | GET | static, no token needed |
 
-```toml
-[custom.cursor-pulse]
-command = "cursor-pulse status"
-format = "[$output]($style) "
-shell = ["bash", "zsh"]
-```
-
-**tmux** — add to `~/.tmux.conf`:
-
-```sh
-set -g status-right "#(cursor-pulse status 2>/dev/null)"
-```
-
-Context usage only appears **after Cursor fires a `preCompact` hook** —
-transcripts on current cursor-agent builds do not carry token counts.
-
-## Preview
-
-The status line is a single, color-coded line:
+Code layout:
 
 ```
-◆ ALLOWLIST │ Composer 2.5 Fast │ cursor-pulse │ main* │ idle (3 cmds, 2 turns, Shell×4) │ ▦███░░ 12% (120K/1.0M) │ ◷ 4m
+app/scim/v2/**/route.ts   thin Next.js route handlers
+lib/scim/http.ts          bearer auth, SCIM errors, JSON helpers
+lib/scim/users.ts         user CRUD + PATCH
+lib/scim/groups.ts        group CRUD + membership PATCH
+lib/scim/patch.ts         PatchOp parsing, Okta/Entra normalisation
+lib/scim/query.ts         filter + pagination
+lib/auth/saml.ts          node-saml config + Postgres request-ID store
+lib/auth/session.ts       Postgres sessions (create, look up, revoke)
+lib/auth/guard.ts         session + capability check for API routes
+lib/authz/                capabilities, access resolution, custom roles
+lib/tools/                mock GitHub/CRM tools and the tool registry
+lib/chat/run.ts           Claude tool-use loop with per-call authorization
+lib/audit.ts              audit writes and queries
+app/admin/audit/          admin page for the audit log
+app/auth/**               login, ACS, metadata, logout routes
+db/schema.sql             all tables; db/seed.sql has the default roles
 ```
 
-| Segment | Source | Shows |
-| --- | --- | --- |
-| `◆ ALLOWLIST` | `cli-config.json` | MODE badge when noteworthy (`MAX`, non-automatic `approvalMode`) |
-| `Composer 2.5 Fast` | `cli-config.json` | Model display name |
-| `cursor-pulse` | captured state | Project directory (basename) |
-| `main*` | git | Branch — `*` means dirty working tree |
-| `idle (…)` | state + transcript | Activity status, command/turn counts, top tool |
-| `███░░ 12% (120K/1.0M)` | `preCompact` hook | Smooth context bar + token counts |
-| `◷ 4m` | `sessionEnd` / elapsed | Session duration |
+### Okta vs Entra ID differences handled
 
-Notifications look like:
+| Behaviour | Okta | Entra ID |
+|---|---|---|
+| Deactivate | `{"op":"replace","value":{"active":false}}` (no path) | `{"op":"Replace","path":"active","value":"False"}` |
+| Op casing | lowercase | Capitalised |
+| Booleans | JSON booleans | sometimes strings (`"False"`) |
+| Remove group member | `path: members[value eq "<id>"]` | `path: members`, `value: [{"value":"<id>"}]` |
+| Rename group | no path, `value: {id, displayName}` | `path: displayName` |
+| Email updates | `emails[primary eq true].value` | `emails[type eq "work"].value` |
+| Extra attributes | — | enterprise extension paths (ignored, not rejected) |
 
-- **cursor-pulse** (title = project folder, or session title if found) —
-  **Cursor is waiting for your input** when a turn ends.
-- Skipped automatically when **this terminal tab** is focused (macOS;
-  Terminal.app / iTerm2).
-- **Click the notification** to jump back to the exact terminal tab (Terminal.app / iTerm2). macOS may prompt once for Automation permission the first time you click.
-- **Cursor needs approval: `<cmd>`** — when a shell command or MCP tool awaits your approval (`beforeShellExecution` / `beforeMCPExecution` observer; fail-open, never auto-allows).
+### Idempotency
 
-## Install
+IdPs retry on timeouts, so every operation is safe to repeat:
 
-```sh
-git clone https://github.com/martinoyovo/cursor-pulse.git
-cd cursor-pulse
-./install.sh
+- **POST** of an existing userName returns `409 uniqueness`. Okta and Entra respond by
+  looking the user up with `filter=userName eq "..."` and carrying on.
+- **PUT** is a full replace, so the same body gives the same result.
+- **PATCH** membership adds use `ON CONFLICT DO NOTHING`; removing a non-member is a no-op;
+  repeating `active: false` is a no-op. PATCHes lock the row, so concurrent ones apply in order.
+- **DELETE** returns 204, then 404 on repeat (required by RFC 7644 §3.6). Both IdPs treat a
+  404 on delete as success.
+
+## Running Okta's SCIM test suite
+
+Okta publishes a SCIM 2.0 spec test and a CRUD test (as API-monitoring / Postman collections)
+on developer.okta.com under *Test your SCIM API*. To run them against this server:
+
+1. Expose the local server: `cloudflared tunnel --url http://localhost:3000`
+   (or `ngrok http 3000`). Set `APP_BASE_URL` in `.env` to the tunnel URL and restart.
+2. Import Okta's test collection into the tool the docs point to, and set its variables:
+   - `SCIMBaseURL` = `https://<your-tunnel>/scim/v2`
+   - `auth` = `Bearer <SCIM_BEARER_TOKEN>`
+   - `UserIdServerSupported` / `filterOp` = `true` / `eq`
+3. Run the spec test. It creates random users, filters for them, paginates, updates and
+   deactivates them.
+4. For an end-to-end check, create a SCIM app integration in your Okta developer tenant
+   (*Applications → Create App Integration → SAML 2.0*, then enable SCIM provisioning), set the
+   connector base URL and bearer token, enable *Create/Update/Deactivate Users* and *Push
+   Groups*, and assign a test user.
+
+Useful manual checks:
+
+```bash
+T="Authorization: Bearer $SCIM_BEARER_TOKEN"
+curl -s localhost:3000/scim/v2/ServiceProviderConfig
+curl -s -H "$T" 'localhost:3000/scim/v2/Users?filter=userName%20eq%20%22ada@example.com%22'
 ```
 
-Or one-shot:
+## Identity matching (SCIM ↔ SAML)
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/martinoyovo/cursor-pulse/main/install.sh | sh
+SCIM creates the user; SAML logs them in. The two are joined on **one field: the lowercased
+email** in `users.email`.
+
+- **SCIM:** `email` comes from the primary `emails[].value`, falling back to `userName` if it
+  looks like an email. A user with neither is rejected (400), since they could never log in.
+- **SAML:** the assertion's `email` attribute (name set by `SAML_EMAIL_ATTRIBUTE`), falling back
+  to an email-format NameID, is lowercased and looked up in the same column.
+- **No just-in-time provisioning.** A valid assertion for someone SCIM never created, or has
+  deactivated, gets a 403. The IdP's assignment is the only way in.
+- **Groups come from SCIM, not the assertion.** The assertion's `groups` are stored on the
+  session for debugging only. Authorization reads `group_members`, so a group change pushed
+  by SCIM applies on the next request instead of at the next login.
+- In Okta, use the same source for both sides: map `user.email` to the SCIM `emails` value
+  *and* to the SAML `email` attribute. If they drift apart, login fails closed (403) rather
+  than signing in the wrong person.
+
+## SAML SSO
+
+SP-initiated only. All SAML parsing and XML-signature checks are done by
+[`@node-saml/node-saml`](https://github.com/node-saml/node-saml); this app has no XML code.
+
+| Route | Purpose |
+|---|---|
+| `GET /auth/saml/login?returnTo=/path` | Builds an AuthnRequest, stores its ID, redirects to Okta |
+| `POST /auth/saml/acs` | Validates the signed response, creates a session, sets the cookie |
+| `GET /auth/saml/metadata` | SP metadata (entity ID + ACS URL) |
+| `POST /auth/logout` | Revokes the session server-side and clears the cookie |
+| `GET /api/me` | Current user and SCIM groups, or 401 |
+
+What a response must pass before a session is created:
+
+- **Signed assertion** from the configured Okta certificate (`wantAssertionsSigned`). Unsigned,
+  tampered, or other-key assertions are rejected.
+- **Audience** equals our SP entity ID, so an assertion minted for another app can't be reused here.
+- **Time window** (`NotBefore`/`NotOnOrAfter`, 30s clock skew).
+- **InResponseTo** matches an AuthnRequest we sent in the last 5 minutes. IDs live in the
+  `saml_requests` table and are deleted on use, which blocks replayed responses and
+  IdP-initiated (unsolicited) logins.
+- **User** exists in SCIM with that email and `active = true`.
+- `RelayState` is only honoured if it is a same-site path, so it can't be used as an open redirect.
+
+### Sessions
+
+Sessions live in the `sessions` table so they can be revoked:
+
+- The cookie holds 32 random bytes. Only its SHA-256 is stored, so a leaked table can't be
+  replayed as cookies.
+- Cookie flags: `HttpOnly`, `SameSite=Lax`, `Secure` when `APP_BASE_URL` is https.
+- Every request looks the session up again, joining `users.active`, so revoking a session or
+  deactivating the user takes effect on the next request. Absolute lifetime is
+  `SESSION_TTL_HOURS` (default 8).
+- `revokeUserSessions(userId)` exists for Phase 4 (deprovisioning).
+
+### Okta setup
+
+1. Start a tunnel: `cloudflared tunnel --url http://localhost:3000`. Put the https URL in
+   `APP_BASE_URL`.
+2. In Okta: **Applications → Create App Integration → SAML 2.0**.
+   - Single sign-on URL: `https://<tunnel>/auth/saml/acs`
+   - Audience URI (SP Entity ID): the value of `SAML_SP_ENTITY_ID`, e.g. `https://<tunnel>/auth/saml/metadata`
+   - Name ID format: EmailAddress; Application username: Email
+   - Attribute statement: `email` → `user.email`
+   - Group attribute statement: `groups`, filter *Matches regex* `.*` (or narrower)
+   - Leave "Response" unsigned and "Assertion Signature" signed (Okta's defaults).
+3. From **Sign On → View SAML setup instructions**, copy the SSO URL into `SAML_ENTRY_POINT` and
+   the X.509 certificate into `SAML_IDP_CERT`.
+4. Assign yourself to the app, make sure SCIM has provisioned you, then open
+   `https://<tunnel>/` and click **Sign in with Okta**.
+
+Tests (`tests/auth.test.ts`) use a fake IdP (`tests/fake-idp.ts`) with throwaway keys in
+`tests/fixtures/` to sign responses, including forged, replayed, expired and wrong-audience ones.
+
+## Roles and tool access
+
+Modeled on Claude Enterprise custom roles: **groups → roles → capabilities → tools**.
+Users never get a role directly. Access always comes from Okta group membership, which
+SCIM keeps in sync.
+
+```mermaid
+flowchart LR
+  U[User] -->|SCIM group_members| G[Okta group]
+  G -->|group_role_mappings| R[Role]
+  R -->|role_capabilities| C[Capability]
+  C --> T[Claude tools / MCP connector]
 ```
 
-The installer copies scripts to `~/.cursor/cursor-pulse/`, merges hook entries
-into `~/.cursor/hooks.json` (observe-only events only), symlinks the CLI, and
-on macOS builds a Cursor-branded `CursorPulse.app` notifier.
+Default roles (seeded once into an empty database from `db/seed.sql`):
 
-```sh
-cursor-pulse status     # render the status line on demand
-cursor-pulse test       # fire a test notification
-cursor-pulse doctor     # check install health
-cursor-pulse update     # re-install the latest version from GitHub
-cursor-pulse uninstall  # remove cursor-pulse
+| Okta group | Role | Capabilities | Claude gets |
+|---|---|---|---|
+| Lab Users | viewer | `chat` | no tools |
+| Engineering | engineer | `chat`, `tool:github` | `github_search_issues`, `github_get_pull_request` |
+| Sales | sales | `chat`, `tool:crm` | `crm_lookup_account`, `crm_list_opportunities` |
+| Lab Admins | admin | `chat`, `admin:roles` | no tools; can manage roles |
+
+Roles are unioned across groups. A user whose groups map to no role gets **nothing, not even
+chat** (fail closed). Capabilities are a fixed list in `lib/authz/capabilities.ts`, so a role
+can't be granted something the code doesn't enforce. The GitHub and CRM tools return mock data.
+
+### How it's enforced
+
+1. **Claude only sees allowed tools.** `/api/chat` resolves the user's capabilities from the
+   database and passes Claude only the matching tool definitions. The system prompt names the
+   user's roles so Claude can explain missing access instead of guessing.
+2. **Every tool call is re-authorized before it runs.** Between tool-use turns the capabilities
+   are re-read. A tool Claude wasn't offered, invents, or lost access to mid-conversation
+   returns an `is_error` tool result saying permission was denied. It is never executed.
+3. **MCP connectors are gated by attaching them or not.** Remote MCP tools run on Anthropic's
+   side, so there is no execute step to intercept. The docs connector (`MCP_DOCS_URL`) is only
+   added to the request (`mcp_servers` + `mcp_toolset`) for roles with `connector:docs`.
+4. **No caching anywhere.** Capabilities are resolved per request (and per tool turn), so a
+   SCIM group change or a role edit applies on the next request, without a re-login.
+5. **The client can't widen access.** The browser sends the transcript, but the tool list and
+   tool execution are decided on the server.
+
+The chat loop is a manual tool-use loop (`lib/chat/run.ts`) rather than the SDK's tool runner,
+so the authorization check sits visibly in the loop. It calls `claude-opus-5-5` (override with
+`CLAUDE_MODEL`) at `effort: medium`, with `fallbacks: "default"`: if a safety classifier
+declines a request, the API retries it server-side on Anthropic's recommended fallback model.
+A refusal that still stands is reported to the user as such.
+
+### Admin API (custom roles)
+
+Requires the `admin:roles` capability.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/admin/roles` | Roles with capabilities and mapped groups, plus the capability catalog |
+| `PUT /api/admin/roles/{name}` | Create or replace a role: `{ "description", "capabilities": [...], "groups": [...] }` |
+| `DELETE /api/admin/roles/{name}` | Delete a role |
+
+A change that would leave no group mapped to a role with `admin:roles` is rejected with 409,
+so admins can't lock themselves out.
+
+```bash
+# Give an Okta "Support" group chat + CRM tools
+curl -X PUT -b "lab_session=..." -H 'content-type: application/json' \
+  https://<tunnel>/api/admin/roles/support \
+  -d '{"description":"Support agents","capabilities":["chat","tool:crm"],"groups":["Support"]}'
 ```
 
-Run `cursor-pulse doctor` for install checks **and** the prompt/tmux snippets above.
+## Deprovisioning
 
-## Configuration
+When Okta (or Entra) removes someone, access ends on their **next request**, not when their
+session would have expired:
 
-Edit `~/.cursor/cursor-pulse/config.sh` (created by the installer, never
-clobbered on update):
+| IdP action | SCIM call | What happens here |
+|---|---|---|
+| Deactivate / unassign | `PATCH active:false` (or `PUT` with `active: false`) | In one transaction: user marked inactive, **all their sessions revoked**, audit entries written |
+| Delete | `DELETE /Users/{id}` | Sessions revoked and counted, audit entry written, user row deleted |
+| Remove from a group | `PATCH /Groups/{id}` members | Capabilities recomputed on the next request or tool turn (Phase 3) |
 
-```sh
-# Icon modes (mutually exclusive — default is plain text):
-# CURSOR_PULSE_NERD=1      # Nerd Font (needs a Nerd Font in your terminal)
-# CURSOR_PULSE_EMOJI=1     # emoji (any terminal)
-# CURSOR_PULSE_SYMBOLS=1   # Unicode symbols: ✦ ▸ ⎇ ▦ ⚙ ◷
+There are three independent safeguards, so a single missed step doesn't leave access open:
 
-CURSOR_PULSE_BAR_WIDTH=12
-CURSOR_PULSE_NOTIFY_SKIP_FOCUSED=1
+1. **Sessions are revoked** (`revoked_at` set) in the same transaction as the deactivation.
+2. **Every session lookup joins `users.active`**, so even an unrevoked session stops working.
+3. **`accessFor()` ignores inactive users**, so a chat request already in progress can't run
+   another tool after the user is deactivated.
+
+Reactivating a user doesn't bring old sessions back; they sign in again.
+
+## Audit log
+
+`audit_log` is **append-only in the database**: triggers reject `UPDATE`, `DELETE` and
+`TRUNCATE`. Each entry has `actor`, `action`, `target`, `occurred_at` and `metadata` (JSON,
+including the client IP). Entries that record a data change are written in the **same
+transaction** as the change, so a change can't commit without its entry. No-op retries
+(for example Okta repeating the same PATCH) aren't logged.
+
+| Action | Actor | Target | Metadata |
+|---|---|---|---|
+| `scim.user.create` / `update` / `deactivate` / `reactivate` / `delete` | `scim` | `user:<id>` | userName, changed fields, `sessionsRevoked` |
+| `scim.group.create` / `rename` / `delete` | `scim` | `group:<id>` | names, member count |
+| `scim.group.member_add` / `member_remove` | `scim` | `user:<id>` | group name and id |
+| `auth.login` / `auth.logout` | `user:<email>` | `user:<id>` | IdP groups, session expiry |
+| `auth.login_failed` | `user:<email>` or `anonymous` | – | reason (bad signature, replay, not provisioned…) |
+| `role.create` / `update` / `delete` | `user:<email>` | `role:<name>` | before and after |
+| `claude.tool_call` / `claude.tool_call_failed` | `user:<email>` | `tool:<name>` | input (capped at 2 KB), capability, `denied`, output size |
+| `admin.audit.query` / `admin.audit.view` | `user:<email>` | – | the filters used |
+
+Design choices:
+
+- Group membership changes are filed under the **user** (`target = user:<id>`), because joining
+  a group can grant a role. Filtering by one user's target gives their whole history:
+  provisioning, privilege changes, logins, tool calls (by actor) and deprovisioning.
+- Tool **outputs aren't stored**, only their size, since they can hold customer data.
+- Reading the audit log is itself audited.
+- No foreign keys, so entries outlive deleted users and groups.
+
+### Reading it
+
+Requires the `admin:audit` capability (the seeded `admin` role has it).
+
+```
+GET /api/admin/audit?actor=&action=<prefix>&target=&since=&until=&limit=&before=<id>
 ```
 
-### Status line
+Results are newest first, up to 500 per page. `action` matches by prefix (`scim.` returns every
+SCIM event). For the next page, pass the returned `nextBefore` as `before`. There is no write
+endpoint.
 
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `CURSOR_PULSE_NERD` | `0` | Nerd Font glyphs (needs a Nerd Font or shows boxes). |
-| `CURSOR_PULSE_EMOJI` | `0` | Emoji icons — works on any terminal. |
-| `CURSOR_PULSE_SYMBOLS` | `0` | Plain Unicode symbols (no special font). |
-| `CURSOR_PULSE_BAR_WIDTH` | `10` | Context bar width in cells. |
-| `CURSOR_PULSE_TOKENS` | `1` | Show `(120K/1.0M)` token counts after context %. |
-| `CURSOR_PULSE_HIDE` | _(none)_ | Comma list: `mode`, `model`, `dir`, `branch`, `activity`, `context`, `duration`, `tools`. |
-| `NO_COLOR` | _(unset)_ | Disable ANSI colors. |
-| `CURSOR_CONFIG_DIR` | `~/.cursor` | Override Cursor config directory. |
+The admin page at **`/admin/audit`** shows the same data with filters, and clicking an actor or
+target filters by it.
 
-### Notifications
+## Limitations (on purpose, for size)
 
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `CURSOR_PULSE_NOTIFY` | `auto` | Backend: `auto`, `terminal-notifier`, `alerter`, `notify-send`, `osa`, `osc9`, `bell`, `off`. |
-| `CURSOR_PULSE_NOTIFY_ON_STOP` | `1` | Notify when a turn ends. |
-| `CURSOR_PULSE_NOTIFY_ON_SESSION_END` | `0` | Notify on session end. |
-| `CURSOR_PULSE_NOTIFY_ON_SHELL` | `0` | Notify after each shell command. |
-| `CURSOR_PULSE_NOTIFY_SKIP_FOCUSED` | `1` | Skip notification when this terminal tab is focused (macOS). |
-| `CURSOR_PULSE_NOTIFY_FOCUS_ON_CLICK` | `1` | Click notification → focus the terminal tab that fired it (macOS). |
-| `CURSOR_PULSE_NOTIFY_ON_APPROVAL` | `1` | Notify when a command/tool needs approval (`beforeShellExecution` / `beforeMCPExecution`). |
-| `CURSOR_PULSE_NOTIFY_DEBOUNCE` | `10` | Suppress duplicate notifications within N seconds per conversation. |
-| `CURSOR_PULSE_NOTIFY_TITLE` | folder name | Override notification title. |
-| `CURSOR_PULSE_NOTIFY_ICON` | _(none)_ | PNG path for `notify-send` only. |
-
-On macOS, install `terminal-notifier` for the best experience (`brew install terminal-notifier`). The installer builds `CursorPulse.app` with Cursor's icon so alerts show the Cursor logo — no `-sender` or `-appIcon` hacks that suppress banners.
-
-## Test
-
-```sh
-# Notification + state (stdout must stay empty)
-echo '{"hook_event_name":"stop","status":"completed","workspace_roots":["'"$PWD"'"],"conversation_id":"t","model":"composer-2.5","cwd":"'"$PWD"'"}' \
-  | ./hooks/notify.sh
-
-# Stdin override (forward-compat test):
-echo '{"root":"/tmp/zzz","status":"error","context_pct":77,"context_tokens":1000,"context_window":2000}' \
-  | NO_COLOR=1 ./statusline.sh
-
-# Status line (reads state + cli-config.json)
-./statusline.sh </dev/null
-
-# With context segment (simulate preCompact capture)
-echo '{"hook_event_name":"preCompact","context_usage_percent":12,"context_tokens":120000,"context_window_size":1000000,"workspace_roots":["'"$PWD"'"],"conversation_id":"t","model":"composer-2.5","cwd":"'"$PWD"'"}' \
-  | ./hooks/notify.sh
-./statusline.sh
-```
-
-## Uninstall
-
-```sh
-cursor-pulse uninstall
-```
-
-## Notes
-
-- **`beforeShellExecution` / `beforeMCPExecution`** — registered as a **fail-open observer** (exit 1, empty stdout) so Cursor keeps its normal approval UI; cursor-pulse only sends a notification, never auto-allows or denies.
-- Other hooks are **observe-only** — no permission changes.
-- Hook scripts must keep **stdout clean** — Cursor parses JSON on stdout.
-- Context % comes only from `preCompact`; transcripts are mined for turns/tools only.
-- `sessionStart` / `sessionEnd` / `stop` require a recent `cursor-agent` version.
-- Status-line design modeled on [claude-pulse 0.5.1](https://github.com/martinoyovo/claude-pulse) and [agy-statusline](https://codeberg.org/jochenkirstaetter/agy-statusline).
-
-## License
-
-MIT, copyright 2026 Martino Yovo. See [LICENSE](LICENSE).
+- Filters: only `attr eq "value"`. Others return `400 invalidFilter` instead of being ignored.
+- No bulk, sort, or `If-Match` enforcement (advertised as unsupported in ServiceProviderConfig).
+- One static bearer token. Production would use per-IdP tokens with rotation.
+- Users are hard-deleted on DELETE. Deactivation (`active: false`) keeps the row.
+- No SAML Single Logout: signing out here doesn't end the Okta session, and vice versa.
+- No encrypted assertions (the transport is TLS; add `decryptionPvk` if your IdP requires it).
+- Chat isn't streamed and transcripts aren't stored server-side.
+- The client IP comes from `X-Forwarded-For`, which is only trustworthy behind a proxy
+  you control (the tunnel). Without one, clients can spoof it.
+- The audit log isn't tamper-evident (no hash chain), and there is no retention or export
+  job. The triggers stop the app from editing it, but a database superuser still could.
+- Group-to-role mappings use group names, so renaming a group in Okta removes its access until
+  the mapping is updated.
