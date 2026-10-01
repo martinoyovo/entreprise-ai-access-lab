@@ -1,5 +1,8 @@
 # Enterprise AI Access Lab
 
+![demo](demo.png)
+
+
 A small Claude-powered chat app whose access is controlled by an enterprise IdP (Okta).
 It mirrors the identity layer of Claude Enterprise: SCIM provisioning, SAML SSO,
 group-based roles, and an audit log. It's a learning and portfolio project, not a product.
