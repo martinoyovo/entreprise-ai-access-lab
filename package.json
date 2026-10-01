@@ -1,0 +1,33 @@
+{
+  "name": "enterprise-ai-access-lab",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude-powered chat gated by an enterprise IdP: SAML SSO, SCIM provisioning, group-based roles, audit log.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.130.0",
+    "@node-saml/node-saml": "^5.1.0",
+    "next": "^15.5.27",
+    "pg": "^8.23.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.3.0",
+    "dotenv": "^18.0.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.3",
+    "xml-crypto": "^6.3.2"
+  },
+  "type": "module"
+}
